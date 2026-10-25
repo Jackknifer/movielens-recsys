@@ -69,7 +69,7 @@ def build_candidate_training(train: pd.DataFrame, users: pd.DataFrame, movies: p
     retrieval_report = train_retrieval(
         samples, directory / "retrieval", max_history=config["max_history"], emb_dim=config["retrieval_emb_dim"],
         num_sampled=config["num_sampled"], temperature=config["temperature"], epochs=config["retrieval_epochs"],
-        batch_size=config["batch_size"], learning_rate=config["learning_rate"], seed=config["seed"],
+        batch_size=config["batch_size"], learning_rate=config.get("retrieval_learning_rate", config["learning_rate"]), seed=config.get("retrieval_seed", config["seed"]),
     )
     state = build_recall_state(directory / "retrieval", users, movies, history, config)
     queries = history.groupby("user_id", as_index=False)["timestamp"].max().rename(columns={"timestamp": "as_of_timestamp"})

@@ -10,6 +10,7 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from tensorflow_recommenders.layers.feature_interaction import Cross
 
 from models.deepfm import FactorizationMachine, LinearSum
+from models.rankmixer import MODEL_IMPLEMENTATION_VERSION, NumericColumns, TokenMixing, validate_rankmixer_model
 from training.ranking_inputs import RANKING_FEATURE_COLUMNS, build_ranking_inputs, unknown_rates
 from features.ranking_features import FEATURE_VERSION, RANKING_NUMERIC_COLUMNS, build_context_features
 from features.feature_join import join_features
@@ -46,10 +47,10 @@ def load_ranking_artifacts(directory: Path) -> RankingArtifacts:
             raise ValueError("排序标准化参数无效")
     model = tf.keras.models.load_model(
         directory / "ranker.keras", compile=False,
-        custom_objects={"FactorizationMachine": FactorizationMachine, "LinearSum": LinearSum, "Cross": Cross},
+        custom_objects={"FactorizationMachine": FactorizationMachine, "LinearSum": LinearSum, "Cross": Cross, "NumericColumns": NumericColumns, "TokenMixing": TokenMixing},
     )
     model_type = report.get("model_type", "deepfm")
-    if model_type not in {"deepfm", "dcnv2"} or model.name != model_type:
+    if model_type not in {"deepfm", "dcnv2", "rankmixer"} or model.name != model_type:
         raise ValueError("排序模型类型与训练报告不一致")
     if model_type == "dcnv2":
         cross_layers = [layer for layer in model.layers if isinstance(layer, Cross)]
@@ -57,6 +58,10 @@ def load_ranking_artifacts(directory: Path) -> RankingArtifacts:
             raise ValueError("DCN-V2 需要使用并行结构和完整矩阵交叉层")
         if len(cross_layers) != report["cross_layers"] or any(layer.get_config()["projection_dim"] is not None for layer in cross_layers):
             raise ValueError("DCN-V2 的交叉层与训练报告不一致")
+    if model_type == "rankmixer":
+        if scaler is None or report["model_implementation_version"] != MODEL_IMPLEMENTATION_VERSION or report["score_semantics"] != "uncalibrated_ranking_logit":
+            raise ValueError("RankMixer 版本、特征或得分含义无效")
+        validate_rankmixer_model(model, report["model_config"], report["token_groups"])
     expected_inputs = set(RANKING_FEATURE_COLUMNS) | ({"context_features"} if scaler is not None else set())
     if set(model.input_names) != expected_inputs or model.output_shape[1:] != (1,):
         raise ValueError("排序模型的输入或输出形状无效")

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+import tensorflow as tf
 
 from evaluation.evaluate_retrieval import _file_sha256
 from retrieval.genre_recall import GenreIndex, build_genre_index
@@ -13,6 +14,7 @@ from retrieval.popular_recall import build_popularity_index
 from ranking.ranking_predict import RankingArtifacts, load_ranking_artifacts
 from retrieval.vector_recall import RetrievalArtifacts, load_retrieval_artifacts
 from data.load import MovieLensData, validate_movielens
+from features.ranking_features import FEATURE_VERSION
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,11 @@ def runtime_code_sha256(project_root: Path) -> dict[str, str]:
 
 
 def validate_code_files(manifest: dict) -> None:
+    if manifest["schema_version"] == 3:
+        compatibility = manifest["runtime_compatibility"]
+        if compatibility["feature_version"] not in {"categorical_v1", FEATURE_VERSION} or compatibility["model_implementation_version"] != 1 or compatibility["tensorflow_major_minor"] != ".".join(tf.__version__.split(".")[:2]):
+            raise ValueError("模型目录与当前运行版本不兼容")
+        return
     project_root = Path(__file__).resolve().parents[2]
     for filename, expected in manifest["code_sha256"].items():
         path = Path(filename)
@@ -75,7 +82,7 @@ def export_bundle(
 ) -> dict:
     directory = require_empty_directory(directory)
     retrieval = load_retrieval_artifacts(retrieval_dir)
-    load_ranking_artifacts(ranking_dir)
+    ranking = load_ranking_artifacts(ranking_dir)
     if config["candidate_budget"] > len(retrieval.movie_ids) or config["neighbors_per_item"] >= len(retrieval.movie_ids):
         raise ValueError("候选数量或近邻数量超过训练电影目录的范围")
     directory.mkdir(parents=True, exist_ok=True)
@@ -94,7 +101,8 @@ def export_bundle(
         with (data_dir / "genres.pkl").open("wb") as destination:
             pickle.dump(genres, destination)
     manifest = {
-        "schema_version": 2, "config": config, "split_policy": "per_user_leave_two_out",
+        "schema_version": 3, "config": config, "split_policy": "per_user_leave_two_out",
+        "runtime_compatibility": {"feature_version": ranking.training_report.get("feature_version", "categorical_v1"), "model_implementation_version": 1, "tensorflow_major_minor": ".".join(tf.__version__.split(".")[:2])},
         "training_users": int(train["user_id"].nunique()), "training_rows": len(train),
         "catalog_size": len(retrieval.movie_ids),
         "files": {str(path.relative_to(directory)): _file_sha256(path) for path in sorted(directory.rglob("*")) if path.is_file()},
@@ -114,7 +122,7 @@ def validate_bundle_files(directory: Path) -> dict:
     directory = Path(directory)
     with (directory / "manifest.json").open(encoding="utf-8") as source:
         manifest = json.load(source)
-    if manifest["schema_version"] != 2:
+    if manifest["schema_version"] not in {2, 3}:
         raise ValueError("无法读取当前 Manifest 版本")
     actual_files = {str(path.relative_to(directory)) for path in directory.rglob("*") if path.is_file() and path.name != "manifest.json"}
     if actual_files != set(manifest["files"]):
@@ -157,13 +165,24 @@ def load_bundle(directory: Path) -> RecommendationBundle:
         "temperature": "temperature", "epochs": "retrieval_epochs", "batch_size": "batch_size",
         "learning_rate": "learning_rate", "seed": "seed",
     }
+    if "retrieval_seed" in config:
+        retrieval_settings["seed"] = "retrieval_seed"
+    if "retrieval_learning_rate" in config:
+        retrieval_settings["learning_rate"] = "retrieval_learning_rate"
     ranking_settings = {
-        "emb_dim": "ranking_emb_dim", "hidden_units": "ranking_hidden_units", "dropout": "ranking_dropout",
+        "emb_dim": "ranking_emb_dim", "dropout": "ranking_dropout",
         "l2": "ranking_l2", "epochs": "ranking_epochs", "batch_size": "batch_size",
         "learning_rate": "learning_rate", "seed": "seed",
     }
-    if ranking.training_report.get("model_type", "deepfm") == "dcnv2":
+    model_type = ranking.training_report.get("model_type", "deepfm")
+    if model_type in {"deepfm", "dcnv2"}:
+        ranking_settings["hidden_units"] = "ranking_hidden_units"
+    if model_type == "dcnv2":
         ranking_settings["cross_layers"] = "ranking_cross_layers"
+    if model_type == "rankmixer":
+        from models.rankmixer import validate_rankmixer_config
+        if config.get("ranking_model") != model_type or validate_rankmixer_config(config["ranking_model_config"]) != ranking.training_report["model_config"]:
+            raise ValueError("RankMixer 模型配置与 Manifest 不一致")
     if ranking.numeric_scaler is not None:
         ranking_settings.update(query_batch_size="ranking_query_batch_size", patience="ranking_patience", selection_k="top_k")
     for report, settings in ((retrieval.training_report, retrieval_settings), (ranking.training_report, ranking_settings)):
