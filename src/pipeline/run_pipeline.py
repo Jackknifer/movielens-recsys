@@ -30,21 +30,8 @@ CONFIG_KEYS = {
 
 
 def validate_config(config: dict) -> None:
-    optional = {"ranking_model", "ranking_model_config", "retrieval_seed", "retrieval_learning_rate"}
-    if not isinstance(config, dict) or not CONFIG_KEYS.issubset(config) or set(config) - CONFIG_KEYS - optional:
+    if not isinstance(config, dict) or set(config) != CONFIG_KEYS:
         raise ValueError("配置需要包含 offline.yaml 中的全部字段")
-    model_type = config.get("ranking_model", "dcnv2")
-    if model_type not in {"dcnv2", "rankmixer"}:
-        raise ValueError("排序模型类型无效")
-    if model_type == "rankmixer":
-        from models.rankmixer import validate_rankmixer_config
-        validate_rankmixer_config(config.get("ranking_model_config"))
-    elif config.get("ranking_model_config"):
-        raise ValueError("DCNv2 使用隐藏层和 Cross 配置")
-    if "retrieval_seed" in config and (isinstance(config["retrieval_seed"], bool) or not isinstance(config["retrieval_seed"], int) or config["retrieval_seed"] < 0):
-        raise ValueError("retrieval_seed 必须是非负整数")
-    if "retrieval_learning_rate" in config and (not np.isfinite(config["retrieval_learning_rate"]) or config["retrieval_learning_rate"] <= 0):
-        raise ValueError("retrieval_learning_rate 必须是有限正数")
     integer_keys = {
         "max_history", "min_history", "retrieval_emb_dim", "num_sampled", "retrieval_epochs", "ranking_emb_dim",
         "ranking_epochs", "ranking_cross_layers", "batch_size", "candidate_budget", "neighbors_per_item", "recent_items", "top_k",
@@ -101,7 +88,6 @@ def train_context_ranking(state, train: pd.DataFrame, validation: pd.DataFrame, 
         batch_size=config["batch_size"], learning_rate=config["learning_rate"], seed=config["seed"],
         cross_layers=config["ranking_cross_layers"], query_batch_size=config["ranking_query_batch_size"],
         patience=config["ranking_patience"], selection_k=config["top_k"],
-        model_type=config.get("ranking_model", "dcnv2"), model_config=config.get("ranking_model_config"),
     )
     context_dir = scratch / "ranking" / "training_context"
     context_dir.mkdir()
@@ -131,7 +117,7 @@ def run_training(config: dict, output_dir: Path, project_root: Path = PROJECT_RO
     train_retrieval(
         retrieval_samples, scratch / "retrieval", max_history=config["max_history"], emb_dim=config["retrieval_emb_dim"],
         num_sampled=config["num_sampled"], temperature=config["temperature"], epochs=config["retrieval_epochs"],
-        batch_size=config["batch_size"], learning_rate=config.get("retrieval_learning_rate", config["learning_rate"]), seed=config.get("retrieval_seed", config["seed"]),
+        batch_size=config["batch_size"], learning_rate=config["learning_rate"], seed=config["seed"],
     )
     state = build_recall_state(scratch / "retrieval", data.users, data.movies, train, config)
     train_context_ranking(state, train, validation, scratch)
@@ -146,19 +132,11 @@ def run_training(config: dict, output_dir: Path, project_root: Path = PROJECT_RO
 def run_ranking_training(
     source_dir: Path, output_dir: Path, cross_layers: int = 3, epochs: int | None = None,
     project_root: Path = PROJECT_ROOT,
-    *, config_path: Path | None = None, ranking_dataset_dir: Path | None = None,
 ) -> dict:
     source_dir, project_root = Path(source_dir), Path(project_root)
     output_dir = require_empty_directory(output_dir)
     source_manifest, data = load_retrieval_source(source_dir)
     config = {"ranking_history_fraction": 0.8, "ranking_query_batch_size": 32, "ranking_patience": 3, **source_manifest["config"], "ranking_cross_layers": cross_layers}
-    if config_path is not None:
-        requested = load_config(config_path)
-        ranking_keys = {"learning_rate", "seed", "ranking_model", "ranking_model_config"} | {name for name in requested if name.startswith("ranking_")}
-        config.update({name: value for name, value in requested.items() if name in ranking_keys})
-    retrieval_report = load_bundle(source_dir).retrieval.training_report
-    config["retrieval_seed"] = retrieval_report["seed"]
-    config["retrieval_learning_rate"] = retrieval_report["learning_rate"]
     if "ranking_patience" not in source_manifest["config"]:
         config["ranking_epochs"] = 10
     if epochs is not None:
@@ -171,29 +149,8 @@ def run_ranking_training(
     validation = validation.loc[validation["user_id"].isin(data.ratings["user_id"])]
     scratch = project_root / ".work" / f"training-ranking-{uuid.uuid4().hex}"
     scratch.mkdir(parents=True)
-    if ranking_dataset_dir is None:
-        state = build_recall_state(source_dir / "retrieval", data.users, data.movies, data.ratings, config)
-        train_context_ranking(state, data.ratings, validation, scratch)
-    else:
-        from training.ranking_dataset import load_ranking_dataset
-        dataset = load_ranking_dataset(ranking_dataset_dir)
-        with (dataset.directory / "reference-bundle" / "manifest.json").open(encoding="utf-8") as source:
-            reference = json.load(source)
-        expected = {name: digest for name, digest in reference["files"].items() if name.startswith(("retrieval/", "indexes/"))}
-        if any(source_manifest["files"].get(name) != digest for name, digest in expected.items()):
-            raise ValueError("排序数据快照与来源召回不一致")
-        train_ranking(
-            dataset.frame("train-records"), scratch / "ranking", dataset.frame("validation-records"),
-            dataset.frame("validation-contexts"), dataset.frame("validation-targets"),
-            load_bundle(source_dir).retrieval.movie_ids, emb_dim=config["ranking_emb_dim"],
-            hidden_units=tuple(config["ranking_hidden_units"]), cross_layers=config["ranking_cross_layers"],
-            dropout=config["ranking_dropout"], l2=config["ranking_l2"], epochs=config["ranking_epochs"],
-            batch_size=config["batch_size"], learning_rate=config["learning_rate"], seed=config["seed"],
-            query_batch_size=config["ranking_query_batch_size"], patience=config["ranking_patience"],
-            selection_k=config["top_k"], model_type=config.get("ranking_model", "dcnv2"),
-            model_config=config.get("ranking_model_config"), prepared=dataset.prepared_training(),
-        )
-        write_json(scratch / "ranking" / "dataset_reference.json", {"manifest_sha256": _file_sha256(dataset.directory / "manifest.json"), "dataset_version": dataset.manifest["dataset_version"]})
+    state = build_recall_state(source_dir / "retrieval", data.users, data.movies, data.ratings, config)
+    train_context_ranking(state, data.ratings, validation, scratch)
     origin = {
         "bundle": str(source_dir.resolve()), "manifest_sha256": _file_sha256(source_dir / "manifest.json"),
         "files": {name: digest for name, digest in source_manifest["files"].items() if name.startswith(("retrieval/", "indexes/"))},
@@ -258,8 +215,6 @@ def main() -> None:
     ranking.add_argument("--output-dir", type=Path, required=True)
     ranking.add_argument("--cross-layers", type=int, default=3)
     ranking.add_argument("--epochs", type=int)
-    ranking.add_argument("--config", type=Path)
-    ranking.add_argument("--ranking-dataset", type=Path)
     recommend = commands.add_parser("recommend")
     recommend.add_argument("--bundle", type=Path, required=True)
     recommend.add_argument("--queries", type=Path, required=True)
@@ -271,7 +226,6 @@ def main() -> None:
     evaluate.add_argument("--split", choices=("validation", "test"), default="validation")
     evaluate.add_argument("--ks", type=int, nargs="+", default=[5, 10, 20])
     evaluate.add_argument("--include-validation-history", action="store_true")
-    evaluate.add_argument("--ranking-dataset", type=Path)
     args = parser.parse_args()
     if args.command == "train":
         config = load_config(args.config)
@@ -282,7 +236,7 @@ def main() -> None:
         manifest = run_training(config, args.output_dir)
         report = {name: manifest[name] for name in ("training_users", "training_rows", "catalog_size")}
     elif args.command == "train-ranking":
-        manifest = run_ranking_training(args.source_bundle, args.output_dir, args.cross_layers, args.epochs, config_path=args.config, ranking_dataset_dir=args.ranking_dataset)
+        manifest = run_ranking_training(args.source_bundle, args.output_dir, args.cross_layers, args.epochs)
         report = {name: manifest[name] for name in ("training_users", "training_rows", "catalog_size", "retrieval_origin")}
     elif args.command == "recommend":
         bundle = load_bundle(args.bundle)
@@ -291,7 +245,7 @@ def main() -> None:
         report = save_recommendation_run(result, args.output_dir, bundle, bundle.config["top_k"] if args.top_k is None else args.top_k)
     else:
         from evaluation.evaluate_pipeline import run_pipeline_evaluation
-        report = run_pipeline_evaluation(args.bundle, args.output_dir, args.split, tuple(args.ks), args.include_validation_history, ranking_dataset_dir=args.ranking_dataset)
+        report = run_pipeline_evaluation(args.bundle, args.output_dir, args.split, tuple(args.ks), args.include_validation_history)
         report = {"split": report["split"], "stages": report["stages"], "binary_metrics": report["binary_metrics"]}
     print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
 

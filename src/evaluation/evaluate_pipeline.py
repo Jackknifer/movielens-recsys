@@ -1,9 +1,7 @@
-import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
 from pipeline.artifact_store import load_bundle, require_empty_directory, write_json, write_result_csv
 from evaluation.evaluate_retrieval import _file_sha256
@@ -12,37 +10,11 @@ from ranking.ranking_predict import predict_records
 from training.ranking_samples import build_observed_samples
 from features.ranking_features import build_context_features, with_recall_metadata
 from pipeline.run_pipeline import PROJECT_ROOT, recommend_from_bundle, save_recommendation_run
-from training.train_ranking import predict_inputs
-from training.ranking_inputs import unknown_rates
-from reranking.diversity_rerank import rerank_candidates
-
-
-def recommend_from_snapshot(bundle, dataset, split: str) -> dict:
-    with (dataset.directory / "reference-bundle" / "manifest.json").open(encoding="utf-8") as source:
-        reference = json.load(source)
-    expected = {name: digest for name, digest in reference["files"].items() if name.startswith(("retrieval/", "indexes/"))}
-    if any(bundle.manifest["files"].get(name) != digest for name, digest in expected.items()):
-        raise ValueError("评估模型的召回与固定候选来源不一致")
-    contexts = dataset.frame(f"{split}-contexts")
-    candidates = dataset.frame(f"{split}-candidates").sort_values(["user_id", "candidate_rank"], kind="stable").reset_index(drop=True)
-    records = dataset.frame(f"{split}-records")
-    pd.testing.assert_frame_equal(candidates[["user_id", "movie_id", "candidate_rank"]], records)
-    inputs = dataset.inputs(split)
-    ranked = candidates.copy()
-    ranked["ranking_score"] = predict_inputs(tf.function(bundle.ranking.model, reduce_retracing=True), inputs)
-    ranked = ranked.sort_values(["user_id", "ranking_score", "movie_id"], ascending=[True, False, True], kind="stable").reset_index(drop=True)
-    ranked["rank"] = ranked.groupby("user_id").cumcount() + 1
-    config = bundle.config
-    reranked = rerank_candidates(ranked, bundle.movies, config["top_k"], config["max_genre_run"], config["max_decade_run"])
-    final = reranked.loc[reranked["rank"] <= config["top_k"]].merge(contexts[["user_id", "is_cold_start", "as_of_timestamp", "user_group"]], on="user_id", validate="many_to_one")
-    channels = {name: dataset.frame(f"{split}-channel-{name}") for name in ("youtubednn", "item_similarity", "genre_interest", "popular")}
-    return {"contexts": contexts, "channels": channels, "merged": candidates, "ranked": ranked, "reranked": reranked, "final": final, "unknown_rates": unknown_rates(inputs)}
 
 
 def run_pipeline_evaluation(
     bundle_dir: Path, output_dir: Path, split: str = "validation", ks: tuple[int, ...] = (5, 10, 20),
     include_validation_history: bool = False, project_root: Path = PROJECT_ROOT,
-    *, ranking_dataset_dir: Path | None = None, save_details: bool = True,
 ) -> dict:
     """固定模型与候选预算，分别评估召回、排序和展示列表。"""
     if split not in {"validation", "test"} or (include_validation_history and split != "test"):
@@ -73,16 +45,7 @@ def run_pipeline_evaluation(
         history = pd.concat([history, validation], ignore_index=True)
         extra_files.append(validation_path)
     # 推荐函数只接收用户与时间；标签在返回候选之后进入评估。
-    dataset = None
-    if ranking_dataset_dir is None:
-        result = recommend_from_bundle(bundle, queries, history)
-    else:
-        from training.ranking_dataset import load_ranking_dataset
-        if include_validation_history:
-            raise ValueError("固定数据快照使用已经记录的推荐历史")
-        dataset = load_ranking_dataset(ranking_dataset_dir)
-        pd.testing.assert_frame_equal(heldout.reset_index(drop=True), dataset.frame(f"{split}-heldout").reset_index(drop=True))
-        result = recommend_from_snapshot(bundle, dataset, split)
+    result = recommend_from_bundle(bundle, queries, history)
     positive = heldout.loc[heldout["rating"] >= bundle.config["positive_threshold"]]
     contexts, movie_ids = result["contexts"], bundle.retrieval.movie_ids
     evaluation_ks = sorted(set(ks) | {bundle.config["candidate_budget"]})
@@ -112,17 +75,10 @@ def run_pipeline_evaluation(
     )
     binary_unknown = None
     if len(observed):
-        if dataset is not None:
-            observed = dataset.frame(f"{split}-observed-records").copy()
-            observed_inputs = dataset.inputs(f"{split}-observed")
-            observed["ranking_score"] = predict_inputs(tf.function(bundle.ranking.model, reduce_retracing=True), observed_inputs)
-            binary_unknown = unknown_rates(observed_inputs)
-        elif bundle.ranking.numeric_scaler is not None:
+        if bundle.ranking.numeric_scaler is not None:
             observed = with_recall_metadata(observed, result["merged"], result["channels"])
             observed = build_context_features(observed, contexts, bundle.movies, bundle.retrieval, bundle.popularity)
-            observed["ranking_score"], binary_unknown = predict_records(observed, bundle.ranking, bundle.config["batch_size"])
-        else:
-            observed["ranking_score"], binary_unknown = predict_records(observed, bundle.ranking, bundle.config["batch_size"])
+        observed["ranking_score"], binary_unknown = predict_records(observed, bundle.ranking, bundle.config["batch_size"])
     else:
         observed["ranking_score"] = pd.Series(dtype=float)
     observed_metrics = binary_metrics(observed, probability_scores=bundle.ranking.numeric_scaler is None)
@@ -140,14 +96,7 @@ def run_pipeline_evaluation(
         "binary_unknown_rates": binary_unknown, "ranking_unknown_rates": result["unknown_rates"],
         "input_sha256": {str(path.resolve()): _file_sha256(path) for path in extra_files + [Path(bundle_dir) / "manifest.json"]},
     }
-    if dataset is not None:
-        report["ranking_dataset_sha256"] = _file_sha256(dataset.directory / "manifest.json")
-    if save_details:
-        save_recommendation_run(result, output_dir, bundle, bundle.config["top_k"])
-    else:
-        output_dir.mkdir(parents=True)
-        for name in ("ranked", "reranked"):
-            write_result_csv(output_dir / f"{name}.csv.gz", result[name][["user_id", "movie_id", "candidate_rank", "ranking_score", "rank"]])
+    save_recommendation_run(result, output_dir, bundle, bundle.config["top_k"])
     write_result_csv(output_dir / "observed_predictions.csv.gz", observed)
     write_json(output_dir / "evaluation_report.json", report)
     return report

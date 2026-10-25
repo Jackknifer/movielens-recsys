@@ -9,7 +9,6 @@ num_sampled: 20
 temperature: 0.1
 retrieval_epochs: 3
 ranking_emb_dim: 16
-ranking_model: dcnv2
 ranking_cross_layers: 3
 ranking_hidden_units: [64, 32]
 ranking_dropout: 0.1
