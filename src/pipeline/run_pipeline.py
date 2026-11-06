@@ -21,7 +21,7 @@ from training.retrieval_samples import build_retrieval_samples
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_KEYS = {
-    "max_users", "positive_threshold", "negative_threshold", "negatives_per_positive", "max_history",
+    "max_users", "positive_threshold", "negative_threshold", "max_history",
     "min_history", "retrieval_emb_dim", "num_sampled", "temperature", "retrieval_epochs", "ranking_emb_dim",
     "ranking_hidden_units", "ranking_cross_layers", "ranking_dropout", "ranking_l2", "ranking_epochs", "batch_size", "learning_rate",
     "seed", "candidate_budget", "neighbors_per_item", "recent_items", "top_k", "max_genre_run", "max_decade_run",
@@ -42,7 +42,7 @@ def validate_config(config: dict) -> None:
         value = config[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} 必须是正整数")
-    for name in ("seed", "negatives_per_positive", "max_users"):
+    for name in ("seed", "max_users"):
         value = config[name]
         if name == "max_users" and value is None:
             continue

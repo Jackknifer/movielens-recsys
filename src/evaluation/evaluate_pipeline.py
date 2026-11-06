@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from pipeline.artifact_store import load_bundle, require_empty_directory, write_json, write_result_csv

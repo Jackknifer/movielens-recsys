@@ -1,7 +1,6 @@
 max_users: null
 positive_threshold: 4.0
 negative_threshold: 2.0
-negatives_per_positive: 1
 max_history: 10
 min_history: 5
 retrieval_emb_dim: 16
