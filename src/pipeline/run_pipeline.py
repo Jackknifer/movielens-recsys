@@ -136,9 +136,7 @@ def run_ranking_training(
     source_dir, project_root = Path(source_dir), Path(project_root)
     output_dir = require_empty_directory(output_dir)
     source_manifest, data = load_retrieval_source(source_dir)
-    config = {"ranking_history_fraction": 0.8, "ranking_query_batch_size": 32, "ranking_patience": 3, **source_manifest["config"], "ranking_cross_layers": cross_layers}
-    if "ranking_patience" not in source_manifest["config"]:
-        config["ranking_epochs"] = 10
+    config = {**source_manifest["config"], "ranking_cross_layers": cross_layers}
     if epochs is not None:
         config["ranking_epochs"] = epochs
     validate_config(config)

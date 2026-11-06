@@ -161,11 +161,9 @@ def load_bundle(directory: Path) -> RecommendationBundle:
         "emb_dim": "ranking_emb_dim", "hidden_units": "ranking_hidden_units", "dropout": "ranking_dropout",
         "l2": "ranking_l2", "epochs": "ranking_epochs", "batch_size": "batch_size",
         "learning_rate": "learning_rate", "seed": "seed",
+        "cross_layers": "ranking_cross_layers", "query_batch_size": "ranking_query_batch_size",
+        "patience": "ranking_patience", "selection_k": "top_k",
     }
-    if ranking.training_report.get("model_type", "deepfm") == "dcnv2":
-        ranking_settings["cross_layers"] = "ranking_cross_layers"
-    if ranking.numeric_scaler is not None:
-        ranking_settings.update(query_batch_size="ranking_query_batch_size", patience="ranking_patience", selection_k="top_k")
     for report, settings in ((retrieval.training_report, retrieval_settings), (ranking.training_report, ranking_settings)):
         if any(report[name] != config[key] for name, key in settings.items()):
             raise ValueError("模型训练设置与 Manifest 不一致")

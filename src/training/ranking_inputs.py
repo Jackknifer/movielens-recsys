@@ -28,7 +28,7 @@ def fit_ranking_encoders(samples: pd.DataFrame) -> dict[str, OrdinalEncoder]:
     return {name: fit_category_encoder(frame[name]) for name in RANKING_FEATURE_COLUMNS}
 
 
-def build_ranking_inputs(records: pd.DataFrame, encoders: dict[str, OrdinalEncoder], numeric_scaler: StandardScaler | None = None) -> dict[str, np.ndarray]:
+def build_ranking_inputs(records: pd.DataFrame, encoders: dict[str, OrdinalEncoder], numeric_scaler: StandardScaler) -> dict[str, np.ndarray]:
     frame = ranking_feature_frame(records)
     if set(encoders) != set(RANKING_FEATURE_COLUMNS):
         raise ValueError("排序编码器的字段不符合输入要求")
@@ -36,11 +36,10 @@ def build_ranking_inputs(records: pd.DataFrame, encoders: dict[str, OrdinalEncod
         name: encode_category(frame[name], encoders[name]).to_numpy(dtype=np.int32)[:, None]
         for name in RANKING_FEATURE_COLUMNS
     }
-    if numeric_scaler is not None:
-        numeric = records[RANKING_NUMERIC_COLUMNS]
-        if not np.isfinite(numeric.to_numpy(dtype=float)).all():
-            raise ValueError("排序数值特征存在无效数值")
-        inputs["context_features"] = numeric_scaler.transform(numeric).astype(np.float32)
+    numeric = records[RANKING_NUMERIC_COLUMNS]
+    if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        raise ValueError("排序数值特征存在无效数值")
+    inputs["context_features"] = numeric_scaler.transform(numeric).astype(np.float32)
     return inputs
 
 

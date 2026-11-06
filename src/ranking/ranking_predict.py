@@ -9,7 +9,6 @@ import tensorflow as tf
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from tensorflow_recommenders.layers.feature_interaction import Cross
 
-from models.deepfm import FactorizationMachine, LinearSum
 from training.ranking_inputs import RANKING_FEATURE_COLUMNS, build_ranking_inputs, unknown_rates
 from features.ranking_features import FEATURE_VERSION, RANKING_NUMERIC_COLUMNS, build_context_features
 from features.feature_join import join_features
@@ -20,44 +19,45 @@ class RankingArtifacts:
     model: tf.keras.Model
     encoders: dict[str, OrdinalEncoder]
     training_report: dict
-    numeric_scaler: StandardScaler | None = None
+    numeric_scaler: StandardScaler
 
 
 def load_ranking_artifacts(directory: Path) -> RankingArtifacts:
     directory = Path(directory)
     with (directory / "training_report.json").open(encoding="utf-8") as source:
         report = json.load(source)
+    if report["model_type"] != "dcnv2":
+        raise ValueError("排序模型必须使用 DCNv2")
+    if report["feature_version"] != FEATURE_VERSION:
+        raise ValueError("无法读取当前排序特征版本")
+    if report["objective"] != "listwise_softmax" or report["score_semantics"] != "uncalibrated_ranking_logit":
+        raise ValueError("DCNv2 的训练目标或得分含义无效")
     with (directory / "encoders.pkl").open("rb") as source:
         encoders = pickle.load(source)
     if set(encoders) != set(RANKING_FEATURE_COLUMNS) or report["feature_columns"] != RANKING_FEATURE_COLUMNS:
         raise ValueError("排序产物的字段不符合输入要求")
-    feature_version = report.get("feature_version", "categorical_v1")
-    if feature_version not in {"categorical_v1", FEATURE_VERSION}:
-        raise ValueError("无法读取当前排序特征版本")
-    scaler = None
-    if feature_version == FEATURE_VERSION:
-        with (directory / "numeric_scaler.pkl").open("rb") as source:
-            scaler = pickle.load(source)
-        if not isinstance(scaler, StandardScaler) or scaler.feature_names_in_.tolist() != RANKING_NUMERIC_COLUMNS or report["numeric_columns"] != RANKING_NUMERIC_COLUMNS:
-            raise ValueError("排序数值特征与训练报告不一致")
-        if not np.array_equal(scaler.mean_, report["numeric_mean"]) or not np.array_equal(scaler.scale_, report["numeric_scale"]):
-            raise ValueError("排序标准化参数与训练报告不一致")
-        if not np.isfinite(scaler.mean_).all() or not np.isfinite(scaler.scale_).all() or (scaler.scale_ <= 0).any():
-            raise ValueError("排序标准化参数无效")
+    with (directory / "numeric_scaler.pkl").open("rb") as source:
+        scaler = pickle.load(source)
+    if not isinstance(scaler, StandardScaler) or scaler.feature_names_in_.tolist() != RANKING_NUMERIC_COLUMNS or report["numeric_columns"] != RANKING_NUMERIC_COLUMNS:
+        raise ValueError("排序数值特征与训练报告不一致")
+    if not np.array_equal(scaler.mean_, report["numeric_mean"]) or not np.array_equal(scaler.scale_, report["numeric_scale"]):
+        raise ValueError("排序标准化参数与训练报告不一致")
+    if not np.isfinite(scaler.mean_).all() or not np.isfinite(scaler.scale_).all() or (scaler.scale_ <= 0).any():
+        raise ValueError("排序标准化参数无效")
     model = tf.keras.models.load_model(
         directory / "ranker.keras", compile=False,
-        custom_objects={"FactorizationMachine": FactorizationMachine, "LinearSum": LinearSum, "Cross": Cross},
+        custom_objects={"Cross": Cross},
     )
-    model_type = report.get("model_type", "deepfm")
-    if model_type not in {"deepfm", "dcnv2"} or model.name != model_type:
+    if model.name != report["model_type"]:
         raise ValueError("排序模型类型与训练报告不一致")
-    if model_type == "dcnv2":
-        cross_layers = [layer for layer in model.layers if isinstance(layer, Cross)]
-        if report["architecture"] != "parallel" or report["cross_projection_dim"] is not None:
-            raise ValueError("DCN-V2 需要使用并行结构和完整矩阵交叉层")
-        if len(cross_layers) != report["cross_layers"] or any(layer.get_config()["projection_dim"] is not None for layer in cross_layers):
-            raise ValueError("DCN-V2 的交叉层与训练报告不一致")
-    expected_inputs = set(RANKING_FEATURE_COLUMNS) | ({"context_features"} if scaler is not None else set())
+    cross_layers = [layer for layer in model.layers if isinstance(layer, Cross)]
+    if report["architecture"] != "parallel" or report["cross_projection_dim"] is not None:
+        raise ValueError("DCNv2 需要使用并行结构和完整矩阵交叉层")
+    if len(cross_layers) != report["cross_layers"] or any(layer.get_config()["projection_dim"] is not None for layer in cross_layers):
+        raise ValueError("DCNv2 的交叉层与训练报告不一致")
+    if model.get_layer("ranking_score").get_config()["activation"] != "linear":
+        raise ValueError("DCNv2 必须输出线性排序得分")
+    expected_inputs = set(RANKING_FEATURE_COLUMNS) | {"context_features"}
     if set(model.input_names) != expected_inputs or model.output_shape[1:] != (1,):
         raise ValueError("排序模型的输入或输出形状无效")
     for tensor in model.inputs:
@@ -88,8 +88,6 @@ def predict_records(records: pd.DataFrame, artifacts: RankingArtifacts, batch_si
     scores = np.concatenate(scores)
     if not np.isfinite(scores).all():
         raise ValueError("ranking_score 必须是有限数值")
-    if artifacts.numeric_scaler is None and ((scores < 0) | (scores > 1)).any():
-        raise ValueError("二分类模型的 ranking_score 必须在 0 到 1 之间")
     return scores, unknown_rates(features)
 
 
@@ -105,11 +103,10 @@ def score_candidates(
         results["ranking_score"] = pd.Series(dtype=float)
         results["rank"] = pd.Series(dtype=np.int64)
         return results, {name: None for name in RANKING_FEATURE_COLUMNS}
+    if contexts is None or retrieval is None or popularity is None:
+        raise ValueError("上下文排序需要用户历史、召回向量和热门统计")
     records = join_features(candidates, users, movies)
-    if artifacts.numeric_scaler is not None:
-        if contexts is None or retrieval is None or popularity is None:
-            raise ValueError("上下文排序需要用户历史、召回向量和热门统计")
-        records = build_context_features(records, contexts, movies, retrieval, popularity)
+    records = build_context_features(records, contexts, movies, retrieval, popularity)
     results["ranking_score"], rates = predict_records(records, artifacts, batch_size)
     results = results.sort_values(["user_id", "ranking_score", "movie_id"], ascending=[True, False, True], kind="stable")
     results["rank"] = results.groupby("user_id").cumcount() + 1

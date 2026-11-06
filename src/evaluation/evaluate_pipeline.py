@@ -74,13 +74,12 @@ def run_pipeline_evaluation(
     )
     binary_unknown = None
     if len(observed):
-        if bundle.ranking.numeric_scaler is not None:
-            observed = with_recall_metadata(observed, result["merged"], result["channels"])
-            observed = build_context_features(observed, contexts, bundle.movies, bundle.retrieval, bundle.popularity)
+        observed = with_recall_metadata(observed, result["merged"], result["channels"])
+        observed = build_context_features(observed, contexts, bundle.movies, bundle.retrieval, bundle.popularity)
         observed["ranking_score"], binary_unknown = predict_records(observed, bundle.ranking, bundle.config["batch_size"])
     else:
         observed["ranking_score"] = pd.Series(dtype=float)
-    observed_metrics = binary_metrics(observed, probability_scores=bundle.ranking.numeric_scaler is None)
+    observed_metrics = binary_metrics(observed, probability_scores=False)
     report = {
         "split": split, "split_policy": bundle.manifest["split_policy"],
         "include_validation_history": include_validation_history,
@@ -88,10 +87,10 @@ def run_pipeline_evaluation(
         "candidate_catalog": "all_exported_known_movie_ids", "catalog_size": len(movie_ids),
         "per_channel_budget": bundle.config["candidate_budget"], "merged_budget": bundle.config["candidate_budget"],
         "config": bundle.config, "stages": stages, "single_channels": single_channels,
-        "ranking_model": bundle.ranking.training_report.get("model_type", "deepfm"),
+        "ranking_model": bundle.ranking.training_report["model_type"],
         "groups": groups, "source_statistics": source_statistics(result["channels"], result["merged"], result["final"], positive),
         "binary_metrics": observed_metrics, "binary_population": "observed_high_or_low_heldout_ratings",
-        "ranking_score_semantics": bundle.ranking.training_report.get("score_semantics", "predicted_sample_label_probability"),
+        "ranking_score_semantics": bundle.ranking.training_report["score_semantics"],
         "binary_unknown_rates": binary_unknown, "ranking_unknown_rates": result["unknown_rates"],
         "input_sha256": {str(path.resolve()): _file_sha256(path) for path in extra_files + [Path(bundle_dir) / "manifest.json"]},
     }

@@ -1,5 +1,4 @@
 import json
-import pickle
 import shutil
 from pathlib import Path
 
@@ -7,29 +6,24 @@ import numpy as np
 import pandas as pd
 import pytest
 import tensorflow as tf
-from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from tensorflow_recommenders.layers.feature_interaction import Cross
 
-from pipeline.artifact_store import export_bundle, load_bundle, load_retrieval_source, validate_bundle_files, write_json
-from retrieval.cold_start import classify_users
-from models.deepfm import FactorizationMachine, build_deepfm
+from pipeline.artifact_store import load_bundle, validate_bundle_files, write_json
 from models.dcnv2 import build_dcnv2
 from reranking.diversity_rerank import movie_diversity_attributes, rerank_candidates
 from evaluation.evaluate_pipeline import run_pipeline_evaluation
 from evaluation.evaluate_retrieval import _file_sha256
-from evaluation.evaluation_metrics import binary_metrics, diversity_metrics, top_k_metrics
+from evaluation.evaluation_metrics import binary_metrics, diversity_metrics
 from retrieval.merge_recall import snake_merge
-from training.negative_sampling import sample_unobserved
-from training.ranking_inputs import RANKING_FEATURE_COLUMNS, build_ranking_inputs, fit_ranking_encoders
+from training.ranking_inputs import build_ranking_inputs
 from training.ranking_candidates import candidate_records
-from features.ranking_features import RANKING_NUMERIC_COLUMNS, build_context_features
+from features.ranking_features import RANKING_NUMERIC_COLUMNS
 from ranking.ranking_predict import load_ranking_artifacts, predict_records, score_candidates
-from training.ranking_samples import build_observed_samples, build_ranking_samples
+from training.ranking_samples import build_observed_samples
 from pipeline.run_pipeline import load_config, recommend_from_bundle, run_ranking_training, run_training
-from features.user_context import build_user_contexts
 from retrieval.vector_recall import recall_users
 from training.train_ranking import listwise_loss
-from features.feature_join import join_features
 from training.retrieval_inputs import build_user_inputs
 
 
@@ -141,30 +135,15 @@ def test_snake_order_matches_independent_bidirectional_traversal(pipeline_result
     assert snake_merge(context, channels, 100)["movie_id"].tolist() == expected
 
 
-def test_real_negative_sampling_is_deterministic_and_excludes_all_interactions(pipeline_bundle):
+def test_observed_samples_match_real_high_and_low_ratings(pipeline_bundle):
     train = pipeline_bundle.history
-    catalog = np.sort(train["movie_id"].unique())
-    first = sample_unobserved(train, catalog, seed=42)
-    second = sample_unobserved(train, catalog, seed=42)
-    pd.testing.assert_frame_equal(first, second)
-    assert first.merge(train[["user_id", "movie_id"]], on=["user_id", "movie_id"]).empty
-    assert set(first["movie_id"]).issubset(catalog)
-    assert not first.duplicated(["user_id", "movie_id"]).any()
-    samples = build_ranking_samples(train, pipeline_bundle.users, pipeline_bundle.movies)
+    samples = build_observed_samples(train, pipeline_bundle.users, pipeline_bundle.movies)
+    assert set(samples["label"]) == {0, 1}
+    assert not samples.duplicated(["user_id", "movie_id"]).any()
     for kind, condition in (("positive", train["rating"] >= 4), ("explicit_negative", train["rating"] <= 2)):
         actual = samples.loc[samples["sample_kind"] == kind, ["user_id", "movie_id"]]
         expected = train.loc[condition, ["user_id", "movie_id"]]
         assert set(map(tuple, actual.to_numpy())) == set(map(tuple, expected.to_numpy()))
-
-
-def test_fm_matches_explicit_pairwise_products_of_real_feature_embeddings(pipeline_bundle):
-    records = build_observed_samples(pipeline_bundle.history, pipeline_bundle.users, pipeline_bundle.movies).iloc[:4]
-    features = build_ranking_inputs(records, pipeline_bundle.ranking.encoders)
-    model = pipeline_bundle.ranking.model
-    embeddings = np.concatenate([model.get_layer(f"{name}_embedding")(values).numpy() for name, values in features.items()], axis=1)
-    expected = sum((embeddings[:, i] * embeddings[:, j]).sum(axis=1) for i in range(embeddings.shape[1]) for j in range(i + 1, embeddings.shape[1]))
-    actual = FactorizationMachine()(tf.convert_to_tensor(embeddings)).numpy().reshape(-1)
-    np.testing.assert_allclose(actual, expected, atol=1e-6)
 
 
 def test_ranking_reloads_and_scores_same_candidates(pipeline_bundle, pipeline_result):
@@ -220,55 +199,25 @@ def test_ranking_only_training_reuses_identical_retrieval_and_indexes(pipeline_b
     assert report["selected_validation"]["ndcg_at_k"] == best["validation_ndcg"]
 
 
-def test_real_deepfm_training_can_supply_retrieval_and_reload_scores(pipeline_bundle, tmp_path):
-    config = pipeline_bundle.config
-    records = build_observed_samples(pipeline_bundle.history, pipeline_bundle.users, pipeline_bundle.movies)
-    assert set(records["label"]) == {0, 1}
-    encoders = fit_ranking_encoders(records)
-    vocab_sizes = {name: len(encoder.categories_[0]) + 2 for name, encoder in encoders.items()}
-    features = build_ranking_inputs(records, encoders)
-    tf.keras.utils.set_random_seed(config["seed"])
-    model = build_deepfm(
-        vocab_sizes, config["ranking_emb_dim"], tuple(config["ranking_hidden_units"]),
-        config["ranking_dropout"], config["ranking_l2"],
-    )
-    model.compile(optimizer=tf.keras.optimizers.Adam(config["learning_rate"]), loss="binary_crossentropy")
-    history = model.fit(
-        features, records["label"].to_numpy(), epochs=config["ranking_epochs"],
-        batch_size=config["batch_size"], verbose=0,
-    )
-    assert np.isfinite(history.history["loss"]).all()
-    before = model({name: values[:16] for name, values in features.items()}, training=False).numpy().reshape(-1)
-    ranking_dir = tmp_path / "ranking"
-    ranking_dir.mkdir()
-    model.save(ranking_dir / "ranker.keras")
-    with (ranking_dir / "encoders.pkl").open("wb") as destination:
-        pickle.dump(encoders, destination)
-    write_json(ranking_dir / "training_report.json", {
-        "model_type": model.name, "feature_version": "categorical_v1",
-        "feature_columns": RANKING_FEATURE_COLUMNS, "vocab_sizes": vocab_sizes,
-        "categories": {name: encoder.categories_[0].tolist() for name, encoder in encoders.items()},
-        "emb_dim": config["ranking_emb_dim"], "hidden_units": config["ranking_hidden_units"],
-        "dropout": config["ranking_dropout"], "l2": config["ranking_l2"],
-        "epochs": config["ranking_epochs"], "batch_size": config["batch_size"],
-        "learning_rate": config["learning_rate"], "seed": config["seed"],
-        "rows": len(records), "loss": history.history["loss"],
-    })
-    directory = tmp_path / "deepfm-bundle"
-    export_bundle(
-        directory, pipeline_bundle.directory / "retrieval", ranking_dir,
-        pipeline_bundle.users, pipeline_bundle.movies, pipeline_bundle.history, config,
-        [Path(filename) for filename in pipeline_bundle.manifest["source_sha256"]], PROJECT_ROOT,
-        indexes_dir=pipeline_bundle.directory / "indexes",
-    )
-    manifest, data = load_retrieval_source(directory)
-    assert manifest["training_users"] == data.ratings["user_id"].nunique() == config["max_users"]
-    ranking = load_ranking_artifacts(directory / "ranking")
-    assert ranking.model.name == "deepfm"
-    scores, _ = predict_records(records.iloc[:16], ranking)
-    assert np.isfinite(scores).all() and ((scores >= 0) & (scores <= 1)).all()
-    np.testing.assert_allclose(scores, before, atol=1e-6, rtol=1e-6)
-    assert load_bundle(directory).ranking.model.name == "deepfm"
+@pytest.mark.parametrize("field", ["model_type", "feature_version"])
+def test_ranking_artifacts_require_current_metadata(pipeline_bundle, tmp_path, field):
+    directory = tmp_path / "ranking"
+    shutil.copytree(pipeline_bundle.directory / "ranking", directory)
+    path = directory / "training_report.json"
+    with path.open(encoding="utf-8") as source:
+        report = json.load(source)
+    report[field] = "unsupported"
+    write_json(path, report)
+    with pytest.raises(ValueError, match="DCNv2|特征版本"):
+        load_ranking_artifacts(directory)
+
+
+def test_ranking_artifacts_require_numeric_scaler(pipeline_bundle, tmp_path):
+    directory = tmp_path / "ranking"
+    shutil.copytree(pipeline_bundle.directory / "ranking", directory)
+    (directory / "numeric_scaler.pkl").unlink()
+    with pytest.raises(FileNotFoundError, match="numeric_scaler"):
+        load_ranking_artifacts(directory)
 
 
 def test_ranking_only_training_checks_source_assets_before_training(pipeline_bundle, tmp_path):
