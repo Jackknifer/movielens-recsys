@@ -2,7 +2,7 @@
 
 使用 TensorFlow 实现 MovieLens 电影推荐流程。
 召回采用 YoutubeDNN 双塔，结合物品相似、类型兴趣和热门召回。
-候选通过 Snake Merge 合并，由 DCNv2 排序，再使用 MMR（最大边际相关）重排。
+候选通过 Snake Merge 合并，由 DCNv2 排序，再通过滑动窗口调整推荐顺序。
 
 ## 数据集
 
@@ -28,21 +28,17 @@
 | 排序损失／训练轮数 | 列表级 Softmax／最多 10 轮 |
 | 提前终止条件 | 连续 3 轮验证指标未改善 |
 | 默认随机种子 | 42 |
-| MMR 相关性权重 λ | 0.35 |
+| 重排窗口长度 | 7 |
+| 窗口内相同主要类型／相同年代上限 | 4／4 |
 | 环境 | Python 3.11、TensorFlow 2.15 |
 
 排序训练使用每位用户前 80% 的训练交互提供历史，其余交互构成目标窗口。
 每位用户保留 100 个候选，最终推荐 20 部电影。
-MMR 使用原始精排分数和电影向量点积，每轮选择综合得分最高的电影。
-
-$$
-\lambda\,\operatorname{score}(u,t)
--(1-\lambda)\max_{s\in S}E_t^\top E_s
-$$
-
-其中，S 是已选电影集合。
-第一部电影采用精排分数最高的候选。
-λ 通过验证集 NDCG@20 选择。
+重排依次处理前 20 个位置，当前位置与前面最近 6 部电影构成检查窗口。
+相同主要类型和相同年代分别最多 4 部；不足 7 部时采用相同数量上限。
+当前电影超限时，按剩余候选的当前顺序，交换第一部同时满足两项规则的电影。
+找不到合格交换对象时，保留当前电影并继续移动窗口。
+全部候选和精排分数保持不变，只更新推荐顺序。
 
 完整配置见 [config/offline.yaml](config/offline.yaml)。
 依据验证集 NDCG@20 选择模型，指标相同时比较 Recall@20。
@@ -57,7 +53,10 @@ $$
 | 阶段 | Recall@20 ↑ | NDCG@20 ↑ | 列表内平均余弦距离 ↑ |
 | --- | ---: | ---: | ---: |
 | DCNv2 排序 | 20.123% | 0.08225 | 0.15557 |
-| MMR 重排 | 20.516% | 0.08304 | 0.16871 |
+| 滑动窗口重排 | 19.534% | 0.08018 | 0.16853 |
+
+全部 6,040 位用户均获得 20 部不同电影。
+测试集共检查 84,560 个完整窗口，其中 1 个窗口超限，涉及 1 位用户。
 
 ## 开源说明
 
@@ -68,4 +67,3 @@ $$
 
 1. Paul Covington, Jay Adams, and Emre Sargin. [Deep Neural Networks for YouTube Recommendations](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/). RecSys, 2016.
 2. Ruoxi Wang et al. [DCN V2: Improved Deep & Cross Network and Practical Lessons for Web-scale Learning to Rank Systems](https://arxiv.org/abs/2008.13535). WWW, 2021.
-3. Jaime Carbonell and Jade Goldstein. [The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries](https://www.cs.cmu.edu/afs/cs/Web/People/jgc/publication/MMR_DiversityBased_Reranking_SIGIR_1998.pdf). SIGIR, 1998.

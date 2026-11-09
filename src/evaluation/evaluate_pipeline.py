@@ -4,7 +4,7 @@ import pandas as pd
 
 from pipeline.artifact_store import load_bundle, require_empty_directory, write_json, write_result_csv
 from evaluation.evaluate_retrieval import _file_sha256
-from evaluation.evaluation_metrics import binary_metrics, diversity_metrics, source_statistics, top_k_metrics
+from evaluation.evaluation_metrics import binary_metrics, diversity_metrics, source_statistics, top_k_metrics, window_constraint_metrics
 from ranking.ranking_predict import predict_records
 from training.ranking_samples import build_observed_samples
 from features.ranking_features import build_context_features, with_recall_metadata
@@ -57,6 +57,9 @@ def run_pipeline_evaluation(
         stages[name] = {
             "top_k": [top_k_metrics(contexts, positive, frame, movie_ids, k) for k in evaluation_ks],
             "diversity": [diversity_metrics(frame, bundle.movies, bundle.popularity, movie_ids, bundle.retrieval.item_vectors, k) for k in sorted(set(ks))],
+            "window_constraints": [window_constraint_metrics(frame, bundle.movies, k, bundle.config["rerank_window_size"],
+                                                            bundle.config["max_genre_count"], bundle.config["max_decade_count"])
+                                   for k in sorted(set(ks))],
         }
     single_channels = {}
     for name, frame in result["channels"].items():

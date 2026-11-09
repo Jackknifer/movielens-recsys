@@ -4,6 +4,7 @@ from sklearn.metrics import log_loss, roc_auc_score
 
 from features.movie_attributes import movie_diversity_attributes
 from evaluation.evaluate_retrieval import evaluate_top_k
+from reranking.sliding_window_rerank import validate_window_parameters
 
 
 def binary_metrics(records: pd.DataFrame, probability_scores: bool = True) -> dict:
@@ -74,6 +75,37 @@ def diversity_metrics(
         "novelty": float(-np.log2(selected["movie_id"].map(probabilities)).mean()) if len(selected) else None,
         "intra_list_diversity": float(np.mean(distances)) if distances else None,
         "max_genre_run": max(genre_runs, default=0), "max_decade_run": max(decade_runs, default=0),
+    }
+
+
+def window_constraint_metrics(
+    results: pd.DataFrame, movies: pd.DataFrame, k: int, window_size: int = 7,
+    max_genre_count: int = 4, max_decade_count: int = 4,
+) -> dict:
+    validate_window_parameters(window_size, max_genre_count, max_decade_count, k)
+    selected = results.loc[results["rank"] <= k]
+    metadata = movie_diversity_attributes(movies).set_index("movie_id")
+    total, genre_violations, decade_violations, violations, affected_users = 0, 0, 0, 0, 0
+    for _, group in selected.groupby("user_id", sort=False):
+        attributes = metadata.loc[group.sort_values("rank")["movie_id"]]
+        genres, decades = (pd.factorize(attributes[column], sort=False)[0] for column in ("primary_genre", "decade"))
+        affected = False
+        for start in range(len(group) - window_size + 1):
+            end = start + window_size
+            genre_violation = np.bincount(genres[start:end]).max() > max_genre_count
+            decade_violation = np.bincount(decades[start:end]).max() > max_decade_count
+            total += 1
+            genre_violations += int(genre_violation)
+            decade_violations += int(decade_violation)
+            violations += int(genre_violation or decade_violation)
+            affected |= bool(genre_violation or decade_violation)
+        affected_users += int(affected)
+    return {
+        "k": k, "window_size": window_size, "max_genre_count": max_genre_count, "max_decade_count": max_decade_count,
+        "users": int(selected["user_id"].nunique()), "total_windows": total,
+        "genre_violating_windows": genre_violations, "decade_violating_windows": decade_violations,
+        "violating_windows": violations, "users_with_violations": affected_users,
+        "violating_window_fraction": violations / total if total else None,
     }
 
 

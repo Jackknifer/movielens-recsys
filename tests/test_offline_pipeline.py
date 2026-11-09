@@ -1,5 +1,6 @@
 import json
 import shutil
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -11,17 +12,18 @@ from tensorflow_recommenders.layers.feature_interaction import Cross
 
 from pipeline.artifact_store import load_bundle, validate_bundle_files, write_json
 from models.dcnv2 import build_dcnv2
-from reranking.mmr_rerank import mmr_order, prepare_rerank_inputs, rerank_candidates
+from reranking.sliding_window_rerank import rerank_candidates, sliding_window_order
 from evaluation.evaluate_pipeline import run_pipeline_evaluation
 from evaluation.evaluate_retrieval import _file_sha256
-from evaluation.evaluation_metrics import binary_metrics, diversity_metrics
+from evaluation.evaluation_metrics import binary_metrics, diversity_metrics, window_constraint_metrics
+from features.movie_attributes import movie_diversity_attributes
 from retrieval.merge_recall import snake_merge
 from training.ranking_inputs import build_ranking_inputs
 from training.ranking_candidates import candidate_records
 from features.ranking_features import RANKING_NUMERIC_COLUMNS
 from ranking.ranking_predict import load_ranking_artifacts, predict_records, score_candidates
 from training.ranking_samples import build_observed_samples
-from pipeline.run_pipeline import load_config, recommend_from_bundle, run_ranking_training, run_training
+from pipeline.run_pipeline import load_config, recommend_from_bundle, run_ranking_training, run_training, validate_config
 from retrieval.vector_recall import recall_users
 from training.train_ranking import listwise_loss
 from training.retrieval_inputs import build_user_inputs
@@ -52,77 +54,67 @@ def pipeline_result(pipeline_bundle, pipeline_queries):
 
 
 @pytest.fixture(scope="module")
-def real_mmr_inputs(pipeline_bundle, pipeline_result):
+def real_window_inputs(pipeline_bundle, pipeline_result):
     ranked = pipeline_result["ranked"]
     group = ranked.loc[ranked["user_id"] == ranked.iloc[0]["user_id"]].sort_values("rank")
-    positions = pd.Series(np.arange(len(pipeline_bundle.retrieval.movie_ids)), index=pipeline_bundle.retrieval.movie_ids)
-    embeddings = pipeline_bundle.retrieval.item_vectors[positions.loc[group["movie_id"]].to_numpy()]
-    return group["ranking_score"].to_numpy(), embeddings
+    metadata = movie_diversity_attributes(pipeline_bundle.movies).set_index("movie_id").loc[group["movie_id"]]
+    return tuple(pd.factorize(metadata[column], sort=False)[0] for column in ("primary_genre", "decade"))
 
 
-@pytest.fixture(scope="module")
-def real_mmr_negative_inputs(pipeline_bundle, pipeline_result):
-    positions = pd.Series(np.arange(len(pipeline_bundle.retrieval.movie_ids)), index=pipeline_bundle.retrieval.movie_ids)
-    for _, group in pipeline_result["ranked"].groupby("user_id", sort=False):
-        group = group.sort_values("rank")
-        embeddings = pipeline_bundle.retrieval.item_vectors[positions.loc[group["movie_id"]].to_numpy()].astype(np.float64)
-        if (embeddings @ embeddings[0]).min() < 0:
-            return group["ranking_score"].to_numpy(), embeddings
-    raise ValueError("真实测试候选中需要存在与首部电影点积为负数的电影")
+def direct_window_swaps(genres, decades, window_size, genre_cap, decade_cap, top_k):
+    order = list(range(len(genres)))
+    events = {"swap_positions": [], "unchanged_violation_positions": []}
+    for position in range(min(top_k, len(order))):
+        previous = order[max(0, position - window_size + 1):position]
+        valid = []
+        for candidate_position in range(position, len(order)):
+            window = previous + [order[candidate_position]]
+            if max(Counter(genres[index] for index in window).values()) <= genre_cap and max(Counter(decades[index] for index in window).values()) <= decade_cap:
+                valid.append(candidate_position)
+        if not valid:
+            events["unchanged_violation_positions"].append(position + 1)
+        elif valid[0] != position:
+            replacement = valid[0]
+            order[position], order[replacement] = order[replacement], order[position]
+            events["swap_positions"].append(position + 1)
+    return order, events
 
 
-@pytest.mark.parametrize("weight", [0.0, 0.3, 0.7, 1.0])
-def test_mmr_matches_direct_objective_on_real_candidates(real_mmr_inputs, weight):
-    scores, embeddings = real_mmr_inputs
-    relevance, similarity = prepare_rerank_inputs(scores, embeddings)
-    actual = mmr_order(relevance, similarity, weight, 20)
-    selected = []
-    for _ in range(20):
-        available = [index for index in range(len(scores)) if index not in selected]
-        if not selected:
-            objectives = [scores[index] for index in available]
-        else:
-            objectives = [weight * scores[index] - (1 - weight) * max(float(np.dot(embeddings[index].astype(np.float64), embeddings[previous].astype(np.float64))) for previous in selected)
-                          for index in available]
-        selected.append(available[int(np.argmax(objectives))])
-    np.testing.assert_array_equal(actual[:20], selected)
-    np.testing.assert_array_equal(np.sort(actual), np.arange(len(scores)))
-    np.testing.assert_array_equal(actual[20:], [index for index in range(len(scores)) if index not in selected])
+@pytest.mark.parametrize("parameters", [(7, 4, 4, 20), (7, 4, 4, 100), (5, 2, 2, 20), (3, 2, 2, 20)])
+def test_window_swaps_match_direct_rules_on_real_candidates(real_window_inputs, parameters):
+    genres, decades = real_window_inputs
+    original_genres, original_decades = genres.copy(), decades.copy()
+    actual, events = sliding_window_order(genres, decades, *parameters)
+    expected, expected_events = direct_window_swaps(genres, decades, *parameters)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(np.sort(actual), np.arange(len(genres)))
+    np.testing.assert_array_equal(genres, original_genres)
+    np.testing.assert_array_equal(decades, original_decades)
+    assert events == expected_events
 
 
-def test_mmr_relevance_endpoint_preserves_all_original_ranks(real_mmr_inputs):
-    scores, embeddings = real_mmr_inputs
-    original_scores, original_embeddings = scores.copy(), embeddings.copy()
-    relevance, similarity = prepare_rerank_inputs(scores, embeddings)
-    np.testing.assert_array_equal(mmr_order(relevance, similarity, 1, len(scores)), np.arange(len(scores)))
-    np.testing.assert_array_equal(scores, original_scores)
-    np.testing.assert_array_equal(embeddings, original_embeddings)
-    np.testing.assert_array_equal(relevance, scores)
-    np.testing.assert_allclose(similarity, embeddings.astype(np.float64) @ embeddings.astype(np.float64).T, atol=1e-14, rtol=0)
+def test_window_keeps_real_movies_when_no_later_candidate_can_satisfy_rule(pipeline_bundle):
+    attributes = movie_diversity_attributes(pipeline_bundle.movies)
+    genre = attributes["primary_genre"].value_counts().index[0]
+    selected = attributes.loc[attributes["primary_genre"] == genre].iloc[:8]
+    assert len(selected) == 8
+    genres, decades = (pd.factorize(selected[column], sort=False)[0] for column in ("primary_genre", "decade"))
+    order, events = sliding_window_order(genres, decades, 7, 4, 7, 20)
+    np.testing.assert_array_equal(order, np.arange(8))
+    assert events == {"swap_positions": [], "unchanged_violation_positions": [5, 6, 7, 8]}
 
 
-@pytest.mark.parametrize("weight", [-0.1, 1.1])
-def test_invalid_mmr_weights_raise_at_entry(real_mmr_inputs, weight):
-    relevance, similarity = prepare_rerank_inputs(*real_mmr_inputs)
+@pytest.mark.parametrize("parameters", [(0, 4, 4, 20), (7, 0, 4, 20), (7, 4, 8, 20), (7, 4, 4, False)])
+def test_invalid_window_parameters_raise_at_entry(real_window_inputs, parameters):
     with pytest.raises(ValueError):
-        mmr_order(relevance, similarity, weight, 20)
+        sliding_window_order(*real_window_inputs, *parameters)
 
 
-def test_mmr_selection_count_cannot_exceed_real_candidates(real_mmr_inputs):
-    relevance, similarity = prepare_rerank_inputs(*real_mmr_inputs)
+@pytest.mark.parametrize("name,value", [("rerank_window_size", 0), ("max_genre_count", True), ("max_decade_count", 8)])
+def test_config_validates_window_parameters(pipeline_bundle, name, value):
+    config = {**pipeline_bundle.config, name: value}
     with pytest.raises(ValueError):
-        mmr_order(relevance, similarity, 0.7, len(relevance) + 1)
-
-
-@pytest.mark.parametrize("weight", [0.0, 0.025, 0.1, 0.3, 0.5])
-def test_mmr_uses_negative_dot_products_from_real_candidates(real_mmr_negative_inputs, weight):
-    scores, embeddings = real_mmr_negative_inputs
-    relevance, similarity = prepare_rerank_inputs(scores, embeddings)
-    assert similarity[0].min() < 0
-    expected_second = int(np.argmax(weight * scores[1:] - (1 - weight) * (embeddings[1:] @ embeddings[0]))) + 1
-    order = mmr_order(relevance, similarity, weight, 20)
-    assert order[0] == 0
-    assert order[1] == expected_second
+        validate_config(config)
 
 
 def test_target_free_context_and_model_inputs(pipeline_bundle, pipeline_queries, pipeline_result):
@@ -398,7 +390,7 @@ def test_context_ranker_requires_declared_features(pipeline_bundle, pipeline_res
         predict_records(records.drop(columns="genre_affinity"), pipeline_bundle.ranking)
 
 
-def test_mmr_reranking_preserves_candidates_scores_and_uses_configured_weight(pipeline_bundle, pipeline_result):
+def test_window_reranking_preserves_candidates_scores_and_uses_configured_rules(pipeline_bundle, pipeline_result):
     ranked, reranked = pipeline_result["ranked"], pipeline_result["reranked"]
     keys = ["user_id", "movie_id"]
     original = ranked.drop(columns="rank").sort_values(keys).reset_index(drop=True)
@@ -406,28 +398,64 @@ def test_mmr_reranking_preserves_candidates_scores_and_uses_configured_weight(pi
     pd.testing.assert_frame_equal(original, actual)
     metrics = diversity_metrics(reranked, pipeline_bundle.movies, pipeline_bundle.popularity, pipeline_bundle.retrieval.movie_ids, pipeline_bundle.retrieval.item_vectors, 20)
     assert 0 <= metrics["intra_list_diversity"] <= 2
-    positions = pd.Series(np.arange(len(pipeline_bundle.retrieval.movie_ids)), index=pipeline_bundle.retrieval.movie_ids)
+    metadata = movie_diversity_attributes(pipeline_bundle.movies).set_index("movie_id")
+    config = pipeline_bundle.config
     for user_id, group in ranked.groupby("user_id", sort=False):
         group = group.sort_values("rank")
-        vectors = pipeline_bundle.retrieval.item_vectors[positions.loc[group["movie_id"]].to_numpy()]
-        relevance, similarity = prepare_rerank_inputs(group["ranking_score"].to_numpy(), vectors)
-        order = mmr_order(relevance, similarity, pipeline_bundle.config["mmr_lambda"], 20)
+        attributes = metadata.loc[group["movie_id"]]
+        order, _ = direct_window_swaps(attributes["primary_genre"].tolist(), attributes["decade"].tolist(),
+                                      config["rerank_window_size"], config["max_genre_count"], config["max_decade_count"], config["top_k"])
         actual_movies = reranked.loc[reranked["user_id"] == user_id].sort_values("rank")["movie_id"].to_numpy()
         np.testing.assert_array_equal(actual_movies, group.iloc[order]["movie_id"].to_numpy())
 
 
-def test_mmr_relevance_endpoint_preserves_original_candidate_order(pipeline_bundle, pipeline_result):
+def test_window_caps_equal_to_length_preserve_original_candidate_order(pipeline_bundle, pipeline_result):
     scored = pipeline_result["ranked"]
-    reranked = rerank_candidates(scored, pipeline_bundle.retrieval.movie_ids, pipeline_bundle.retrieval.item_vectors,
-                                top_k=20, relevance_weight=1.0)
+    reranked = rerank_candidates(scored, pipeline_bundle.movies, top_k=20, window_size=7, max_genre_count=7, max_decade_count=7)
     pd.testing.assert_frame_equal(scored, reranked)
 
 
-def test_mmr_rejects_candidates_without_vectors(pipeline_bundle, pipeline_result):
+def test_window_rejects_candidates_without_attributes(pipeline_bundle, pipeline_result):
     scored = pipeline_result["ranked"]
-    retained = pipeline_bundle.retrieval.movie_ids != scored.iloc[0]["movie_id"]
-    with pytest.raises(ValueError, match="电影向量"):
-        rerank_candidates(scored, pipeline_bundle.retrieval.movie_ids[retained], pipeline_bundle.retrieval.item_vectors[retained])
+    retained = pipeline_bundle.movies.loc[pipeline_bundle.movies["movie_id"] != scored.iloc[0]["movie_id"]]
+    with pytest.raises(ValueError, match="电影属性"):
+        rerank_candidates(scored, retained)
+
+
+def test_window_handles_empty_candidates_and_uses_rank_instead_of_row_order(pipeline_bundle, pipeline_result):
+    scored = pipeline_result["ranked"]
+    empty = scored.iloc[:0]
+    pd.testing.assert_frame_equal(rerank_candidates(empty, pipeline_bundle.movies), empty)
+    shuffled = rerank_candidates(scored.sample(frac=1, random_state=42), pipeline_bundle.movies)
+    expected = pipeline_result["reranked"].sort_values(["user_id", "rank"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(shuffled.sort_values(["user_id", "rank"]).reset_index(drop=True), expected)
+
+
+def test_window_metrics_match_independent_counts(pipeline_bundle, pipeline_result):
+    movies = movie_diversity_attributes(pipeline_bundle.movies).set_index("movie_id")
+    final = pipeline_result["final"]
+    violations, genre_violations, decade_violations, affected_users = 0, 0, 0, 0
+    for _, group in final.groupby("user_id"):
+        attributes = movies.loc[group.sort_values("rank")["movie_id"]]
+        affected = False
+        for start in range(14):
+            window = attributes.iloc[start:start + 7]
+            genre = max(Counter(window["primary_genre"]).values()) > 4
+            decade = max(Counter(window["decade"]).values()) > 4
+            genre_violations += int(genre)
+            decade_violations += int(decade)
+            violations += int(genre or decade)
+            affected |= genre or decade
+        affected_users += int(affected)
+    metrics = window_constraint_metrics(final, pipeline_bundle.movies, 20)
+    assert metrics["total_windows"] == 280
+    assert metrics["genre_violating_windows"] == genre_violations
+    assert metrics["decade_violating_windows"] == decade_violations
+    assert metrics["violating_windows"] == violations
+    assert metrics["users_with_violations"] == affected_users
+    assert metrics["violating_window_fraction"] == violations / 280
+    prefix = window_constraint_metrics(final, pipeline_bundle.movies, 5)
+    assert prefix["total_windows"] == 0 and prefix["violating_window_fraction"] is None
 
 
 def test_binary_metrics_match_real_observed_predictions(pipeline_bundle):
@@ -452,6 +480,9 @@ def test_full_evaluation_reports_fixed_budget_and_real_stages(pipeline_bundle, t
     assert report["binary_metrics"]["gauc"] is None
     assert report["groups"]["no_history"]["users"] == 0
     assert report["groups"]["no_history"]["stages"]["merged"][0]["recall_at_k"] is None
+    windows = report["stages"]["reranked"]["window_constraints"][-1]
+    assert windows["window_size"] == 7 and windows["total_windows"] == 280
+    assert windows["max_genre_count"] == windows["max_decade_count"] == 4
     with (tmp_path / "evaluation" / "evaluation_report.json").open() as source:
         assert json.load(source) == report
 
