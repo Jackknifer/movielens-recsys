@@ -11,7 +11,7 @@ from tensorflow_recommenders.layers.feature_interaction import Cross
 
 from pipeline.artifact_store import load_bundle, validate_bundle_files, write_json
 from models.dcnv2 import build_dcnv2
-from reranking.diversity_rerank import movie_diversity_attributes, rerank_candidates
+from reranking.mmr_rerank import mmr_order, prepare_rerank_inputs, rerank_candidates
 from evaluation.evaluate_pipeline import run_pipeline_evaluation
 from evaluation.evaluate_retrieval import _file_sha256
 from evaluation.evaluation_metrics import binary_metrics, diversity_metrics
@@ -49,6 +49,80 @@ def pipeline_queries(pipeline_bundle):
 @pytest.fixture(scope="module")
 def pipeline_result(pipeline_bundle, pipeline_queries):
     return recommend_from_bundle(pipeline_bundle, pipeline_queries)
+
+
+@pytest.fixture(scope="module")
+def real_mmr_inputs(pipeline_bundle, pipeline_result):
+    ranked = pipeline_result["ranked"]
+    group = ranked.loc[ranked["user_id"] == ranked.iloc[0]["user_id"]].sort_values("rank")
+    positions = pd.Series(np.arange(len(pipeline_bundle.retrieval.movie_ids)), index=pipeline_bundle.retrieval.movie_ids)
+    embeddings = pipeline_bundle.retrieval.item_vectors[positions.loc[group["movie_id"]].to_numpy()]
+    return group["ranking_score"].to_numpy(), embeddings
+
+
+@pytest.fixture(scope="module")
+def real_mmr_negative_inputs(pipeline_bundle, pipeline_result):
+    positions = pd.Series(np.arange(len(pipeline_bundle.retrieval.movie_ids)), index=pipeline_bundle.retrieval.movie_ids)
+    for _, group in pipeline_result["ranked"].groupby("user_id", sort=False):
+        group = group.sort_values("rank")
+        embeddings = pipeline_bundle.retrieval.item_vectors[positions.loc[group["movie_id"]].to_numpy()].astype(np.float64)
+        if (embeddings @ embeddings[0]).min() < 0:
+            return group["ranking_score"].to_numpy(), embeddings
+    raise ValueError("真实测试候选中需要存在与首部电影点积为负数的电影")
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.3, 0.7, 1.0])
+def test_mmr_matches_direct_objective_on_real_candidates(real_mmr_inputs, weight):
+    scores, embeddings = real_mmr_inputs
+    relevance, similarity = prepare_rerank_inputs(scores, embeddings)
+    actual = mmr_order(relevance, similarity, weight, 20)
+    selected = []
+    for _ in range(20):
+        available = [index for index in range(len(scores)) if index not in selected]
+        if not selected:
+            objectives = [scores[index] for index in available]
+        else:
+            objectives = [weight * scores[index] - (1 - weight) * max(float(np.dot(embeddings[index].astype(np.float64), embeddings[previous].astype(np.float64))) for previous in selected)
+                          for index in available]
+        selected.append(available[int(np.argmax(objectives))])
+    np.testing.assert_array_equal(actual[:20], selected)
+    np.testing.assert_array_equal(np.sort(actual), np.arange(len(scores)))
+    np.testing.assert_array_equal(actual[20:], [index for index in range(len(scores)) if index not in selected])
+
+
+def test_mmr_relevance_endpoint_preserves_all_original_ranks(real_mmr_inputs):
+    scores, embeddings = real_mmr_inputs
+    original_scores, original_embeddings = scores.copy(), embeddings.copy()
+    relevance, similarity = prepare_rerank_inputs(scores, embeddings)
+    np.testing.assert_array_equal(mmr_order(relevance, similarity, 1, len(scores)), np.arange(len(scores)))
+    np.testing.assert_array_equal(scores, original_scores)
+    np.testing.assert_array_equal(embeddings, original_embeddings)
+    np.testing.assert_array_equal(relevance, scores)
+    np.testing.assert_allclose(similarity, embeddings.astype(np.float64) @ embeddings.astype(np.float64).T, atol=1e-14, rtol=0)
+
+
+@pytest.mark.parametrize("weight", [-0.1, 1.1])
+def test_invalid_mmr_weights_raise_at_entry(real_mmr_inputs, weight):
+    relevance, similarity = prepare_rerank_inputs(*real_mmr_inputs)
+    with pytest.raises(ValueError):
+        mmr_order(relevance, similarity, weight, 20)
+
+
+def test_mmr_selection_count_cannot_exceed_real_candidates(real_mmr_inputs):
+    relevance, similarity = prepare_rerank_inputs(*real_mmr_inputs)
+    with pytest.raises(ValueError):
+        mmr_order(relevance, similarity, 0.7, len(relevance) + 1)
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.025, 0.1, 0.3, 0.5])
+def test_mmr_uses_negative_dot_products_from_real_candidates(real_mmr_negative_inputs, weight):
+    scores, embeddings = real_mmr_negative_inputs
+    relevance, similarity = prepare_rerank_inputs(scores, embeddings)
+    assert similarity[0].min() < 0
+    expected_second = int(np.argmax(weight * scores[1:] - (1 - weight) * (embeddings[1:] @ embeddings[0]))) + 1
+    order = mmr_order(relevance, similarity, weight, 20)
+    assert order[0] == 0
+    assert order[1] == expected_second
 
 
 def test_target_free_context_and_model_inputs(pipeline_bundle, pipeline_queries, pipeline_result):
@@ -324,27 +398,36 @@ def test_context_ranker_requires_declared_features(pipeline_bundle, pipeline_res
         predict_records(records.drop(columns="genre_affinity"), pipeline_bundle.ranking)
 
 
-def test_reranking_preserves_candidates_and_scores_and_obeys_prefix_limits(pipeline_bundle, pipeline_result):
+def test_mmr_reranking_preserves_candidates_scores_and_uses_configured_weight(pipeline_bundle, pipeline_result):
     ranked, reranked = pipeline_result["ranked"], pipeline_result["reranked"]
     keys = ["user_id", "movie_id"]
     original = ranked.drop(columns="rank").sort_values(keys).reset_index(drop=True)
     actual = reranked.drop(columns="rank").sort_values(keys).reset_index(drop=True)
     pd.testing.assert_frame_equal(original, actual)
     metrics = diversity_metrics(reranked, pipeline_bundle.movies, pipeline_bundle.popularity, pipeline_bundle.retrieval.movie_ids, pipeline_bundle.retrieval.item_vectors, 20)
-    assert metrics["max_genre_run"] <= 2 and metrics["max_decade_run"] <= 2
     assert 0 <= metrics["intra_list_diversity"] <= 2
+    positions = pd.Series(np.arange(len(pipeline_bundle.retrieval.movie_ids)), index=pipeline_bundle.retrieval.movie_ids)
+    for user_id, group in ranked.groupby("user_id", sort=False):
+        group = group.sort_values("rank")
+        vectors = pipeline_bundle.retrieval.item_vectors[positions.loc[group["movie_id"]].to_numpy()]
+        relevance, similarity = prepare_rerank_inputs(group["ranking_score"].to_numpy(), vectors)
+        order = mmr_order(relevance, similarity, pipeline_bundle.config["mmr_lambda"], 20)
+        actual_movies = reranked.loc[reranked["user_id"] == user_id].sort_values("rank")["movie_id"].to_numpy()
+        np.testing.assert_array_equal(actual_movies, group.iloc[order]["movie_id"].to_numpy())
 
 
-def test_reranking_rejects_unavailable_prefix_constraints(pipeline_bundle, pipeline_result):
-    attributes = movie_diversity_attributes(pipeline_bundle.movies).set_index("movie_id")
+def test_mmr_relevance_endpoint_preserves_original_candidate_order(pipeline_bundle, pipeline_result):
     scored = pipeline_result["ranked"]
-    user = scored.loc[scored["user_id"] == scored.iloc[0]["user_id"]].copy()
-    user["primary_genre"] = user["movie_id"].map(attributes["primary_genre"])
-    group = next(group for _, group in user.groupby("primary_genre") if len(group) >= 3)
-    group = group.iloc[:3].drop(columns="primary_genre")
-    group["rank"] = np.arange(1, len(group) + 1)
-    with pytest.raises(ValueError, match="重排限制"):
-        rerank_candidates(group, pipeline_bundle.movies, top_k=3, max_genre_run=1)
+    reranked = rerank_candidates(scored, pipeline_bundle.retrieval.movie_ids, pipeline_bundle.retrieval.item_vectors,
+                                top_k=20, relevance_weight=1.0)
+    pd.testing.assert_frame_equal(scored, reranked)
+
+
+def test_mmr_rejects_candidates_without_vectors(pipeline_bundle, pipeline_result):
+    scored = pipeline_result["ranked"]
+    retained = pipeline_bundle.retrieval.movie_ids != scored.iloc[0]["movie_id"]
+    with pytest.raises(ValueError, match="电影向量"):
+        rerank_candidates(scored, pipeline_bundle.retrieval.movie_ids[retained], pipeline_bundle.retrieval.item_vectors[retained])
 
 
 def test_binary_metrics_match_real_observed_predictions(pipeline_bundle):

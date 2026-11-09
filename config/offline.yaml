@@ -23,5 +23,4 @@ candidate_budget: 100
 neighbors_per_item: 50
 recent_items: 3
 top_k: 20
-max_genre_run: 2
-max_decade_run: 2
+mmr_lambda: 0.35

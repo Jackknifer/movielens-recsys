@@ -9,7 +9,7 @@ import pandas as pd
 import yaml
 
 from pipeline.artifact_store import export_bundle, load_bundle, load_retrieval_source, require_empty_directory, write_json, write_result_csv
-from reranking.diversity_rerank import rerank_candidates
+from reranking.mmr_rerank import rerank_candidates
 from evaluation.evaluate_retrieval import _file_sha256
 from ranking.ranking_predict import score_candidates
 from training.ranking_candidates import build_candidate_training, build_recall_state, candidate_records, generate_candidates
@@ -24,7 +24,7 @@ CONFIG_KEYS = {
     "max_users", "positive_threshold", "negative_threshold", "max_history",
     "min_history", "retrieval_emb_dim", "num_sampled", "temperature", "retrieval_epochs", "ranking_emb_dim",
     "ranking_hidden_units", "ranking_cross_layers", "ranking_dropout", "ranking_l2", "ranking_epochs", "batch_size", "learning_rate",
-    "seed", "candidate_budget", "neighbors_per_item", "recent_items", "top_k", "max_genre_run", "max_decade_run",
+    "seed", "candidate_budget", "neighbors_per_item", "recent_items", "top_k", "mmr_lambda",
     "ranking_history_fraction", "ranking_query_batch_size", "ranking_patience",
 }
 
@@ -35,7 +35,6 @@ def validate_config(config: dict) -> None:
     integer_keys = {
         "max_history", "min_history", "retrieval_emb_dim", "num_sampled", "retrieval_epochs", "ranking_emb_dim",
         "ranking_epochs", "ranking_cross_layers", "batch_size", "candidate_budget", "neighbors_per_item", "recent_items", "top_k",
-        "max_genre_run", "max_decade_run",
         "ranking_query_batch_size", "ranking_patience",
     }
     for name in integer_keys:
@@ -53,6 +52,8 @@ def validate_config(config: dict) -> None:
         raise ValueError("评分阈值无效")
     if not np.isfinite(config["ranking_history_fraction"]) or not 0 < config["ranking_history_fraction"] < 1:
         raise ValueError("ranking_history_fraction 必须位于 0 和 1 之间")
+    if isinstance(config["mmr_lambda"], bool) or not np.isfinite(config["mmr_lambda"]) or not 0 <= config["mmr_lambda"] <= 1:
+        raise ValueError("mmr_lambda 必须位于 0 和 1 之间")
     for name in ("temperature", "learning_rate"):
         if not np.isfinite(config[name]) or config[name] <= 0:
             raise ValueError(f"{name} 必须是有限正数")
@@ -172,7 +173,8 @@ def recommend_from_bundle(bundle, queries: pd.DataFrame, history: pd.DataFrame |
     result = generate_candidates(bundle, queries, history)
     contexts, channels, merged = result["contexts"], result["channels"], result["merged"]
     ranked, rates = score_candidates(merged, bundle.ranking, bundle.users, bundle.movies, config["batch_size"], contexts=contexts, retrieval=bundle.retrieval, popularity=bundle.popularity)
-    reranked = rerank_candidates(ranked, bundle.movies, top_k, config["max_genre_run"], config["max_decade_run"])
+    reranked = rerank_candidates(ranked, bundle.retrieval.movie_ids, bundle.retrieval.item_vectors,
+                                top_k=top_k, relevance_weight=config["mmr_lambda"])
     final = reranked.loc[reranked["rank"] <= top_k].merge(
         contexts[["user_id", "is_cold_start", "as_of_timestamp", "user_group"]], on="user_id", validate="many_to_one",
     )
